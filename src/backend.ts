@@ -1,14 +1,21 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v3";
-import { exec } from "child_process";
-import { promisify } from "util";
 import { readFile } from "fs/promises";
 import { resolve } from "path";
-
-const execAsync = promisify(exec);
-
-const API_BASE_URL = "https://api.cursor.com";
-const REQUEST_TIMEOUT_MS = 30000;
+import { apiRequest, repositoriesTimeout } from "./api-client.js";
+import { detectGitContext } from "./git-utils.js";
+import type {
+  Agent,
+  CreateAgentResponse,
+  CreateRunResponse,
+  IdResponse,
+  ListAgentsResponse,
+  ListModelsResponse,
+  ListRepositoriesResponse,
+  ListRunsResponse,
+  MeResponse,
+  Run,
+} from "./types.js";
 
 // ============================================================================
 // CONFIGURATION
@@ -22,140 +29,95 @@ if (!apiKey) {
 }
 
 // ============================================================================
-// API CLIENT
+// HELPERS
 // ============================================================================
 
-async function apiRequest<T>(
-  method: "GET" | "POST" | "DELETE",
-  path: string,
-  body?: unknown
-): Promise<T> {
-  const url = `${API_BASE_URL}${path}`;
-  const authHeader = `Basic ${Buffer.from(`${apiKey}:`).toString("base64")}`;
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  try {
-    const options: RequestInit = {
-      method,
-      headers: {
-        Authorization: authHeader,
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-    };
-
-    if (body) {
-      options.body = JSON.stringify(body);
-    }
-
-    const response = await fetch(url, options);
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      let errorText: string;
-      try {
-        errorText = await response.text();
-      } catch {
-        errorText = "Unable to read error response";
-      }
-      throw new Error(`API error ${response.status}: ${errorText}`);
-    }
-
-    return response.json() as Promise<T>;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Request timeout after ${REQUEST_TIMEOUT_MS}ms`);
-    }
-    throw error;
-  }
+function toolResult(data: object) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    structuredContent: data as Record<string, unknown>,
+  };
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
+function toolError(error: unknown) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{ type: "text" as const, text: `Error: ${errorMessage}` }],
+    isError: true as const,
+  };
+}
 
-// Helper function to check if text matches a regex pattern
 function matchesRegex(text: string, pattern: string): boolean {
   try {
-    const regex = new RegExp(pattern, "i"); // case-insensitive
+    const regex = new RegExp(pattern, "i");
     return regex.test(text);
   } catch (error) {
-    // Invalid regex pattern - log error but don't throw
     console.error(`Invalid regex pattern: ${pattern}`, error);
     return false;
   }
 }
 
-// Helper function to detect git context
-async function detectGitContext(cwd: string): Promise<{
-  is_git_repo: boolean;
-  repository?: string;
-  branch?: string;
-  has_uncommitted_changes?: boolean;
-}> {
-  try {
-    await execAsync("git rev-parse --is-inside-work-tree", { cwd });
-  } catch {
-    return { is_git_repo: false };
+function parseRepoUrl(url: string): { owner: string; name: string; repository: string } {
+  const normalized = url.replace(/\.git$/, "");
+  const match = normalized.match(/github\.com[/:]([^/]+)\/([^/]+)/i);
+  if (match) {
+    return {
+      owner: match[1],
+      name: match[2],
+      repository: `https://github.com/${match[1]}/${match[2]}`,
+    };
   }
+  return { owner: "", name: "", repository: normalized };
+}
 
-  let repository: string | undefined;
+function agentSearchString(agent: Agent, run?: Run): string {
+  const branches = run?.git?.branches ?? [];
+  return [
+    agent.id,
+    agent.name,
+    agent.status,
+    agent.url ?? "",
+    agent.createdAt,
+    agent.latestRunId ?? "",
+    ...(agent.repos ?? []).flatMap((r) => [r.url, r.startingRef ?? "", r.prUrl ?? ""]),
+    run?.status ?? "",
+    run?.result ?? "",
+    ...branches.flatMap((b) => [b.repoUrl, b.branch ?? "", b.prUrl ?? ""]),
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+async function getLatestRun(agent: Agent): Promise<Run | undefined> {
+  if (!agent.latestRunId) return undefined;
   try {
-    const { stdout: remoteUrl } = await execAsync("git remote get-url origin", {
-      cwd,
-    });
-    repository = remoteUrl.trim();
-    // Convert SSH to HTTPS
-    if (repository.startsWith("git@github.com:")) {
-      repository = repository
-        .replace("git@github.com:", "https://github.com/")
-        .replace(/\.git$/, "");
-    } else if (repository.endsWith(".git")) {
-      repository = repository.replace(/\.git$/, "");
-    }
+    return await apiRequest<Run>(
+      "GET",
+      `/v1/agents/${agent.id}/runs/${agent.latestRunId}`
+    );
   } catch {
-    // Try any remote
-    try {
-      const { stdout: remotes } = await execAsync("git remote", { cwd });
-      const firstRemote = remotes.trim().split("\n")[0];
-      if (firstRemote) {
-        const { stdout: remoteUrl } = await execAsync(
-          `git remote get-url ${firstRemote}`,
-          { cwd }
-        );
-        repository = remoteUrl.trim();
-      }
-    } catch {
-      // No remotes
-    }
+    return undefined;
   }
+}
 
-  let branch: string | undefined;
-  try {
-    const { stdout } = await execAsync("git branch --show-current", { cwd });
-    branch = stdout.trim() || undefined;
-    if (!branch) {
-      const { stdout: commit } = await execAsync("git rev-parse --short HEAD", {
-        cwd,
-      });
-      branch = `detached@${commit.trim()}`;
-    }
-  } catch {
-    // Ignore
-  }
-
-  let has_uncommitted_changes = false;
-  try {
-    const { stdout } = await execAsync("git status --porcelain", { cwd });
-    has_uncommitted_changes = stdout.trim().length > 0;
-  } catch {
-    // Ignore
-  }
-
-  return { is_git_repo: true, repository, branch, has_uncommitted_changes };
+function enrichAgent(agent: Agent, run?: Run) {
+  const primaryBranch = run?.git?.branches?.[0];
+  return {
+    ...agent,
+    latestRun: run
+      ? {
+          id: run.id,
+          status: run.status,
+          result: run.result,
+          durationMs: run.durationMs,
+          createdAt: run.createdAt,
+          updatedAt: run.updatedAt,
+        }
+      : undefined,
+    branch: primaryBranch?.branch,
+    prUrl: primaryBranch?.prUrl,
+    git: run?.git,
+  };
 }
 
 // ============================================================================
@@ -163,24 +125,24 @@ async function detectGitContext(cwd: string): Promise<{
 // ============================================================================
 
 export function setupServer(server: McpServer): void {
-  // ============================================================================
-  // TOOLS: CONTEXT & DISCOVERY (Start here to find repositories)
-  // ============================================================================
+  // --------------------------------------------------------------------------
+  // TOOLS: CONTEXT & DISCOVERY
+  // --------------------------------------------------------------------------
 
   server.registerTool(
     "get_repos",
     {
       title: "Get Repositories",
-      description: `Get available repositories. First checks if you are in a git directory and returns that repo as "current". Then optionally lists other accessible repos from the API. Call this FIRST before creating tasks to get the repository URL.
+      description: `Get available repositories. First checks if you are in a git directory and returns that repo as "current". Then optionally lists other accessible repos from the API. Call this FIRST before creating agents to get the repository URL.
 
 **Usage Examples:**
 - Basic: Get current repo only: \`get_repos()\`
 - Fetch all repos with filter (REQUIRED): \`get_repos({ include_all: true, regex_patterns: ["^my-.*"] })\`
 - Filter with multiple patterns (OR): \`get_repos({ include_all: true, regex_patterns: [".*api.*", ".*backend.*"] })\`
 
-**Important:** When using \`include_all: true\`, you MUST provide \`regex_patterns\` to filter the results. This prevents returning too many repositories.
+**Important:** When using \`include_all: true\`, you MUST provide \`regex_patterns\` to filter the results. This prevents returning too many repositories. The repositories endpoint is rate limited (1/min, 30/hour) and can take tens of seconds.
 
-**Workflow:** Use this tool first to discover repositories, then use the repository URL with \`create_task\` to start working on a repo.`,
+**Workflow:** Use this tool first to discover repositories, then use the repository URL with \`create_agent\` to start working on a repo.`,
       inputSchema: {
         include_all: z
           .boolean()
@@ -244,7 +206,6 @@ export function setupServer(server: McpServer): void {
           total_count?: number;
         } = {};
 
-        // Add current repo if in git directory
         let currentRepo:
           | {
               repository: string;
@@ -260,12 +221,10 @@ export function setupServer(server: McpServer): void {
           };
         }
 
-        // Fetch all repos if requested
         let allRepos:
           | Array<{ owner: string; name: string; repository: string }>
           | undefined;
         if (args.include_all) {
-          // Require filters when fetching all repos
           if (!args.regex_patterns || args.regex_patterns.length === 0) {
             return {
               content: [
@@ -278,14 +237,13 @@ export function setupServer(server: McpServer): void {
             };
           }
           try {
-            const data = await apiRequest<{
-              repositories: Array<{
-                owner: string;
-                name: string;
-                repository: string;
-              }>;
-            }>("GET", "/v0/repositories");
-            allRepos = data.repositories;
+            const data = await apiRequest<ListRepositoriesResponse>(
+              "GET",
+              "/v1/repositories",
+              undefined,
+              repositoriesTimeout()
+            );
+            allRepos = data.items.map((item) => parseRepoUrl(item.url));
             result.total_count = allRepos.length;
           } catch (error) {
             const errorMessage =
@@ -294,9 +252,7 @@ export function setupServer(server: McpServer): void {
           }
         }
 
-        // Apply regex filtering if patterns provided
         if (args.regex_patterns && args.regex_patterns.length > 0) {
-          // Filter current repo
           if (currentRepo) {
             const repoString = `${currentRepo.repository} ${
               currentRepo.branch || ""
@@ -309,7 +265,6 @@ export function setupServer(server: McpServer): void {
             }
           }
 
-          // Filter available repos
           if (allRepos) {
             const filtered = allRepos.filter((repo) => {
               const repoString =
@@ -322,7 +277,6 @@ export function setupServer(server: McpServer): void {
             result.filtered_count = filtered.length;
           }
         } else {
-          // No filtering - return all
           if (currentRepo) {
             result.current = currentRepo;
           }
@@ -331,23 +285,14 @@ export function setupServer(server: McpServer): void {
           }
         }
 
-        // Add helpful message if no current repo
         if (!result.current && !result.available) {
           result.message =
             "Not in a git repository. Call again with include_all: true to list accessible repos (rate limited).";
         }
 
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
-        };
+        return toolResult(result);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );
@@ -365,27 +310,18 @@ export function setupServer(server: McpServer): void {
       outputSchema: {
         apiKeyName: z.string(),
         createdAt: z.string(),
-        userEmail: z.string(),
+        userId: z.number().optional(),
+        userEmail: z.string().optional(),
+        userFirstName: z.string().optional(),
+        userLastName: z.string().optional(),
       },
     },
     async () => {
       try {
-        const data = await apiRequest<{
-          apiKeyName: string;
-          createdAt: string;
-          userEmail: string;
-        }>("GET", "/v0/me");
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
-        };
+        const data = await apiRequest<MeResponse>("GET", "/v1/me");
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );
@@ -394,81 +330,111 @@ export function setupServer(server: McpServer): void {
     "get_models",
     {
       title: "Get Available Models",
-      description: `List all available LLM models for cloud tasks. If you omit the model parameter in \`create_task\`, the system will auto-select the most appropriate model.
+      description: `List recommended LLM models for cloud agents (API v1). Each item includes id, displayName, parameters, and variants. Pass \`model.id\` to \`create_agent\`. If you omit the model parameter, Cursor uses the configured default.
 
 **Usage Example:** \`get_models()\`
 
-**Workflow:** Use this to see available models, then optionally specify one in \`create_task\`. For most cases, omitting the model parameter (auto-selection) is recommended.`,
+**Workflow:** Use this to see available models, then optionally specify one in \`create_agent\`. For most cases, omitting the model parameter (auto-selection) is recommended.`,
       inputSchema: {},
-      outputSchema: { models: z.array(z.string()) },
+      outputSchema: {
+        items: z.array(
+          z.object({
+            id: z.string(),
+            displayName: z.string(),
+            description: z.string().optional(),
+            aliases: z.array(z.string()).optional(),
+          })
+        ),
+        models: z.array(z.string()),
+      },
     },
     async () => {
       try {
-        const data = await apiRequest<{ models: string[] }>(
-          "GET",
-          "/v0/models"
-        );
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
+        const data = await apiRequest<ListModelsResponse>("GET", "/v1/models");
+        const result = {
+          items: data.items,
+          models: data.items.map((m) => m.id),
         };
+        return toolResult(result);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );
 
-  // ============================================================================
-  // TOOLS: TASK LIFECYCLE (Create, monitor, and manage tasks)
-  // ============================================================================
+  // --------------------------------------------------------------------------
+  // TOOLS: AGENT LIFECYCLE (v1: durable agent + per-prompt runs)
+  // --------------------------------------------------------------------------
 
   server.registerTool(
-    "create_task",
+    "create_agent",
     {
-      title: "Create Cloud Task",
-      description: `Launch a new cloud task to work on a repository. Requires a repository URL and task prompt. Returns a task ID that you can use to monitor progress with \`get_task\` or \`list_tasks\`.
+      title: "Create Cloud Agent",
+      description: `Launch a new cloud agent (API v1). Creates a durable agent and immediately enqueues its initial run. Returns both \`agent\` and \`run\` objects.
 
 **Usage Examples:**
-- Basic: \`create_task({ prompt: "Add README.md", repository: "https://github.com/owner/repo" })\`
-- With branch: \`create_task({ prompt: "Fix bug", repository: "https://github.com/owner/repo", ref: "main" })\`
-- Auto-create PR: \`create_task({ prompt: "Add feature", repository: "https://github.com/owner/repo", auto_pr: true })\`
-- Custom branch: \`create_task({ prompt: "Add feature", repository: "https://github.com/owner/repo", branch_name: "feature/new-feature" })\`
-- With plan file: \`create_task({ prompt: "Implement features", repository: "https://github.com/owner/repo", plan_file: "./plan.md" })\`
+- Basic: \`create_agent({ prompt: "Add README.md", repository: "https://github.com/owner/repo" })\`
+- With branch: \`create_agent({ prompt: "Fix bug", repository: "https://github.com/owner/repo", ref: "main" })\`
+- Auto-create PR: \`create_agent({ prompt: "Add feature", repository: "https://github.com/owner/repo", auto_pr: true })\`
+- Plan mode: \`create_agent({ prompt: "Design auth", repository: "https://github.com/owner/repo", mode: "plan" })\`
+- With plan file: \`create_agent({ prompt: "Implement features", repository: "https://github.com/owner/repo", plan_file: "./plan.md" })\`
 
-**Workflow:** 
+**Workflow:**
 1. Use \`get_repos\` to discover repository URLs
-2. Call \`create_task\` with your task prompt
-3. Use \`list_tasks\` or \`get_task\` to monitor progress
-4. Use \`add_followup\` to send additional instructions to running tasks`,
+2. Call \`create_agent\` with your prompt
+3. Use \`get_agent\` / \`get_run\` to monitor progress (agent status: ACTIVE|IDLE|ARCHIVED; run status: CREATING|RUNNING|FINISHED|ERROR|CANCELLED|EXPIRED)
+4. Use \`create_run\` to send follow-up instructions when the agent is IDLE`,
       inputSchema: {
         prompt: z.string().min(1).describe("Task instructions"),
         repository: z
           .string()
           .url()
+          .optional()
           .describe(
-            "GitHub repository URL (e.g., https://github.com/owner/repo)"
+            "GitHub repository URL (e.g., https://github.com/owner/repo). Omit for a no-repo agent."
           ),
         ref: z
           .string()
           .optional()
-          .describe("Git branch, tag, or commit to work from"),
+          .describe("Git branch, tag, or commit to work from (startingRef)"),
+        pr_url: z
+          .string()
+          .url()
+          .optional()
+          .describe(
+            "GitHub PR URL — agent works on that PR's branches; startingRef is ignored"
+          ),
         auto_pr: z
           .boolean()
           .optional()
           .describe("Auto-create a PR when done (default: false)"),
-        branch_name: z
-          .string()
+        work_on_current_branch: z
+          .boolean()
           .optional()
-          .describe("Custom branch name for the task to create"),
+          .describe(
+            "Push directly to startingRef instead of creating a cursor/... branch (default: false)"
+          ),
+        skip_reviewer_request: z
+          .boolean()
+          .optional()
+          .describe(
+            "Skip requesting the user as reviewer when auto_pr is true"
+          ),
         model: z
           .string()
           .optional()
-          .describe("LLM model to use (omit for auto-selection)"),
+          .describe("LLM model id from get_models (omit for default)"),
+        name: z
+          .string()
+          .max(100)
+          .optional()
+          .describe("Display name for the agent (auto-derived if omitted)"),
+        mode: z
+          .enum(["agent", "plan"])
+          .optional()
+          .describe(
+            "Initial conversation mode: agent (implement) or plan (draft a plan first)"
+          ),
         plan_file: z
           .string()
           .optional()
@@ -477,28 +443,26 @@ export function setupServer(server: McpServer): void {
           ),
       },
       outputSchema: {
-        id: z.string(),
-        name: z.string(),
-        status: z.string(),
-        source: z.object({
-          repository: z.string(),
-          ref: z.string().optional(),
-        }),
-        target: z.object({
-          branchName: z.string().optional(),
+        agent: z.object({
+          id: z.string(),
+          name: z.string(),
+          status: z.string(),
           url: z.string().optional(),
-          autoCreatePr: z.boolean().optional(),
-          openAsCursorGithubApp: z.boolean().optional(),
-          skipReviewerRequest: z.boolean().optional(),
+          latestRunId: z.string().optional(),
+          createdAt: z.string(),
         }),
-        createdAt: z.string(),
+        run: z.object({
+          id: z.string(),
+          agentId: z.string(),
+          status: z.string(),
+          createdAt: z.string(),
+        }),
       },
     },
     async (args) => {
       try {
         let promptText = args.prompt;
 
-        // Read plan file if provided
         if (args.plan_file) {
           try {
             const planPath = resolve(args.plan_file);
@@ -521,98 +485,181 @@ export function setupServer(server: McpServer): void {
 
         const requestBody: Record<string, unknown> = {
           prompt: { text: promptText },
-          source: { repository: args.repository },
         };
 
-        if (args.ref) {
-          (requestBody.source as Record<string, unknown>).ref = args.ref;
-        }
-
-        if (args.auto_pr !== undefined || args.branch_name) {
-          requestBody.target = {
-            autoCreatePr: args.auto_pr,
-            branchName: args.branch_name,
+        if (args.repository || args.pr_url) {
+          if (args.pr_url && !args.repository) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Error: repository is required when pr_url is set (API v1 requires repos[].url alongside prUrl).",
+                },
+              ],
+              isError: true,
+            };
+          }
+          const repo: Record<string, unknown> = {
+            url: args.repository!,
           };
+          if (args.pr_url) {
+            repo.prUrl = args.pr_url;
+          }
+          if (args.ref && !args.pr_url) {
+            repo.startingRef = args.ref;
+          }
+          requestBody.repos = [repo];
         }
 
+        if (args.auto_pr !== undefined) {
+          requestBody.autoCreatePR = args.auto_pr;
+        }
+        if (args.work_on_current_branch !== undefined) {
+          requestBody.workOnCurrentBranch = args.work_on_current_branch;
+        }
+        if (args.skip_reviewer_request !== undefined) {
+          requestBody.skipReviewerRequest = args.skip_reviewer_request;
+        }
         if (args.model) {
-          requestBody.model = args.model;
+          requestBody.model = { id: args.model };
+        }
+        if (args.name) {
+          requestBody.name = args.name;
+        }
+        if (args.mode) {
+          requestBody.mode = args.mode;
         }
 
-        const data = await apiRequest<{
-          id: string;
-          name: string;
-          status: string;
-          source: { repository: string; ref?: string };
-          target: {
-            branchName?: string;
-            url?: string;
-            autoCreatePr?: boolean;
-            openAsCursorGithubApp?: boolean;
-            skipReviewerRequest?: boolean;
-          };
-          createdAt: string;
-        }>("POST", "/v0/agents", requestBody);
+        const data = await apiRequest<CreateAgentResponse>(
+          "POST",
+          "/v1/agents",
+          requestBody
+        );
 
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
-        };
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
+        return toolError(error);
+      }
+    }
+  );
+
+  // Backwards-compatible alias
+  server.registerTool(
+    "create_task",
+    {
+      title: "Create Cloud Task (alias)",
+      description:
+        "Alias for `create_agent`. Prefer `create_agent` — Cloud Agents API v1 uses durable agents plus per-prompt runs.",
+      inputSchema: {
+        prompt: z.string().min(1).describe("Task instructions"),
+        repository: z
+          .string()
+          .url()
+          .describe(
+            "GitHub repository URL (e.g., https://github.com/owner/repo)"
+          ),
+        ref: z
+          .string()
+          .optional()
+          .describe("Git branch, tag, or commit to work from"),
+        auto_pr: z
+          .boolean()
+          .optional()
+          .describe("Auto-create a PR when done (default: false)"),
+        model: z
+          .string()
+          .optional()
+          .describe("LLM model to use (omit for auto-selection)"),
+        plan_file: z
+          .string()
+          .optional()
+          .describe(
+            "Path to a plan file to include in the prompt (relative or absolute path)"
+          ),
+      },
+    },
+    async (args) => {
+      // Delegate by reusing create_agent logic via direct API call path —
+      // invoke the same handler body by calling create_agent's endpoint.
+      try {
+        let promptText = args.prompt;
+        if (args.plan_file) {
+          const planPath = resolve(args.plan_file);
+          const planContent = await readFile(planPath, "utf-8");
+          promptText = `${args.prompt}\n\n## Plan File\n\n${planContent}`;
+        }
+
+        const requestBody: Record<string, unknown> = {
+          prompt: { text: promptText },
+          repos: [
+            {
+              url: args.repository,
+              ...(args.ref ? { startingRef: args.ref } : {}),
+            },
+          ],
         };
+        if (args.auto_pr !== undefined) {
+          requestBody.autoCreatePR = args.auto_pr;
+        }
+        if (args.model) {
+          requestBody.model = { id: args.model };
+        }
+
+        const data = await apiRequest<CreateAgentResponse>(
+          "POST",
+          "/v1/agents",
+          requestBody
+        );
+
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
 
   server.registerTool(
-    "list_tasks",
+    "list_agents",
     {
-      title: "List Cloud Tasks",
-      description: `List all cloud tasks for the authenticated user. Returns comprehensive information including IDs, status, repository, branch, summary, PR URLs, and creation time. Use this to find task IDs for monitoring or follow-up.
+      title: "List Cloud Agents",
+      description: `List cloud agents for the authenticated user (API v1), newest first. List items are lean — call \`get_agent\` for full details including repos and latest run status.
 
 **Usage Examples:**
-- Basic listing: \`list_tasks()\`
-- Filter by status: \`list_tasks({ filter: "FINISHED|RUNNING" })\`
-- Filter by repository: \`list_tasks({ filter: ".*my-repo.*" })\`
-- Filter by branch name: \`list_tasks({ filter: "feature/.*" })\`
-- Filter by summary: \`list_tasks({ filter: ".*README.*" })\`
-- Combine filters: \`list_tasks({ filter: "FINISHED.*my-repo" })\`
+- Basic listing: \`list_agents()\`
+- Filter by status: \`list_agents({ filter: "ACTIVE|IDLE" })\`
+- Filter by repository: \`list_agents({ filter: ".*my-repo.*" })\`
+- Include only non-archived: \`list_agents({ include_archived: false })\`
+- Filter by PR: \`list_agents({ pr_url: "https://github.com/org/repo/pull/1" })\`
 
-**Workflow:** After creating tasks with \`create_task\`, use this tool to monitor their status. Then use \`get_task\` for detailed status or \`add_followup\` to send instructions to running tasks.`,
+**Agent status:** ACTIVE (turn running), IDLE (accepts follow-ups), ARCHIVED.
+**Run status** lives on runs — use \`get_agent\` or \`get_run\`.`,
       inputSchema: {
         limit: z.number().int().min(1).max(100).optional(),
         cursor: z.string().optional(),
+        pr_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Filter agents by GitHub pull request URL"),
+        include_archived: z
+          .boolean()
+          .optional()
+          .describe("Include archived agents (default: true)"),
         filter: z
           .string()
           .optional()
           .describe(
-            'Regex pattern to filter tasks. Searches across all fields (id, name, status, repository, ref, branchName, summary, etc.) concatenated together. Example: "FINISHED|RUNNING" or ".*my-repo.*"'
+            'Regex pattern to filter agents across id, name, status, url, etc. Example: "ACTIVE|IDLE" or ".*my-repo.*"'
           ),
       },
       outputSchema: {
-        tasks: z.array(
+        agents: z.array(
           z.object({
             id: z.string(),
             name: z.string(),
             status: z.string(),
-            source: z.object({
-              repository: z.string(),
-              ref: z.string().optional(),
-            }),
-            target: z.object({
-              branchName: z.string().optional(),
-              url: z.string().optional(),
-              prUrl: z.string().optional(),
-              autoCreatePr: z.boolean().optional(),
-              openAsCursorGithubApp: z.boolean().optional(),
-              skipReviewerRequest: z.boolean().optional(),
-            }),
-            summary: z.string().optional(),
+            url: z.string().optional(),
+            latestRunId: z.string().optional(),
             createdAt: z.string(),
           })
         ),
@@ -626,79 +673,109 @@ export function setupServer(server: McpServer): void {
         const params = new URLSearchParams();
         if (args.limit) params.append("limit", args.limit.toString());
         if (args.cursor) params.append("cursor", args.cursor);
+        if (args.pr_url) params.append("prUrl", args.pr_url);
+        if (args.include_archived !== undefined) {
+          params.append("includeArchived", String(args.include_archived));
+        }
 
-        const path = `/v0/agents${params.toString() ? `?${params}` : ""}`;
-        const data = await apiRequest<{
-          agents: Array<{
-            id: string;
-            name: string;
-            status: string;
-            source: { repository: string; ref?: string };
-            target: {
-              branchName?: string;
-              url?: string;
-              prUrl?: string;
-              autoCreatePr?: boolean;
-              openAsCursorGithubApp?: boolean;
-              skipReviewerRequest?: boolean;
-            };
-            summary?: string;
-            createdAt: string;
-          }>;
-          nextCursor?: string;
-        }>("GET", path);
+        const path = `/v1/agents${params.toString() ? `?${params}` : ""}`;
+        const data = await apiRequest<ListAgentsResponse>("GET", path);
 
-        let filteredTasks = data.agents;
-        const totalCount = data.agents.length;
+        let filtered = data.items;
+        const totalCount = data.items.length;
 
-        // Apply regex filter if provided
         if (args.filter) {
-          filteredTasks = data.agents.filter((task) => {
-            // Concatenate all task fields into a single string
-            const searchString = [
-              task.id,
-              task.name,
-              task.status,
-              task.source.repository,
-              task.source.ref || "",
-              task.target.branchName || "",
-              task.target.url || "",
-              task.target.prUrl || "",
-              task.summary || "",
-              task.createdAt,
-              task.target.autoCreatePr?.toString() || "",
-              task.target.openAsCursorGithubApp?.toString() || "",
-              task.target.skipReviewerRequest?.toString() || "",
-            ]
-              .join(" ")
-              .toLowerCase();
-
-            return matchesRegex(searchString, args.filter!);
-          });
+          filtered = data.items.filter((agent) =>
+            matchesRegex(agentSearchString(agent), args.filter!)
+          );
         }
 
         const result = {
-          tasks: filteredTasks,
+          agents: filtered,
           nextCursor: data.nextCursor,
           ...(args.filter
             ? {
-                filtered_count: filteredTasks.length,
+                filtered_count: filtered.length,
                 total_count: totalCount,
               }
             : {}),
         };
 
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
-        };
+        return toolResult(result);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_tasks",
+    {
+      title: "List Cloud Tasks (alias)",
+      description:
+        "Alias for `list_agents`. Prefer `list_agents` — Cloud Agents API v1 uses agents, not tasks.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(100).optional(),
+        cursor: z.string().optional(),
+        filter: z.string().optional(),
+      },
+    },
+    async (args) => {
+      try {
+        const params = new URLSearchParams();
+        if (args.limit) params.append("limit", args.limit.toString());
+        if (args.cursor) params.append("cursor", args.cursor);
+        const path = `/v1/agents${params.toString() ? `?${params}` : ""}`;
+        const data = await apiRequest<ListAgentsResponse>("GET", path);
+
+        let filtered = data.items;
+        if (args.filter) {
+          filtered = data.items.filter((agent) =>
+            matchesRegex(agentSearchString(agent), args.filter!)
+          );
+        }
+
+        const result = {
+          agents: filtered,
+          tasks: filtered,
+          nextCursor: data.nextCursor,
         };
+
+        return toolResult(result);
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_agent",
+    {
+      title: "Get Agent Status",
+      description: `Get durable metadata for a cloud agent, plus its latest run (execution status, result, branches, PR URL).
+
+**Usage Example:** \`get_agent({ id: "bc-..." })\`
+
+**Agent status:** ACTIVE | IDLE | ARCHIVED
+**Run status:** CREATING | RUNNING | FINISHED | ERROR | CANCELLED | EXPIRED
+
+**Workflow:** After \`create_agent\` or \`list_agents\`, use this to monitor. When status is IDLE, send follow-ups with \`create_run\`.`,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID (e.g., bc-...)"),
+      },
+    },
+    async (args) => {
+      try {
+        const agent = await apiRequest<Agent>(
+          "GET",
+          `/v1/agents/${args.id}`
+        );
+        const run = await getLatestRun(agent);
+        const data = enrichAgent(agent, run);
+
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
@@ -706,72 +783,76 @@ export function setupServer(server: McpServer): void {
   server.registerTool(
     "get_task",
     {
-      title: "Get Task Status",
-      description: `Get the current status and full details of a specific cloud task. Returns comprehensive information including status (CREATING, RUNNING, FINISHED, FAILED, CANCELLED), summary of work done, repository, branch, PR URL if created, and all configuration options.
-
-**Usage Example:** \`get_task({ id: "bc_abc123" })\`
-
-**Status Values:**
-- CREATING: Task is being initialized
-- RUNNING: Task is actively working
-- FINISHED: Task completed successfully
-- FAILED: Task encountered an error
-- CANCELLED: Task was cancelled
-
-**Workflow:** After creating a task with \`create_task\` or finding one with \`list_tasks\`, use this tool to get detailed status. Check the status field to determine if you need to wait, send follow-ups with \`add_followup\`, or review results.`,
+      title: "Get Task Status (alias)",
+      description:
+        "Alias for `get_agent`. Prefer `get_agent` — Cloud Agents API v1 uses agents, not tasks.",
       inputSchema: {
-        id: z.string().min(1).describe("Task ID (e.g., bc_abc123)"),
-      },
-      outputSchema: {
-        id: z.string(),
-        name: z.string(),
-        status: z.string(),
-        source: z.object({
-          repository: z.string(),
-          ref: z.string().optional(),
-        }),
-        target: z.object({
-          branchName: z.string().optional(),
-          url: z.string().optional(),
-          prUrl: z.string().optional(),
-          autoCreatePr: z.boolean().optional(),
-          openAsCursorGithubApp: z.boolean().optional(),
-          skipReviewerRequest: z.boolean().optional(),
-        }),
-        summary: z.string().optional(),
-        createdAt: z.string(),
+        id: z.string().min(1).describe("Agent ID (e.g., bc-...)"),
       },
     },
     async (args) => {
       try {
-        const data = await apiRequest<{
-          id: string;
-          name: string;
-          status: string;
-          source: { repository: string; ref?: string };
-          target: {
-            branchName?: string;
-            url?: string;
-            prUrl?: string;
-            autoCreatePr?: boolean;
-            openAsCursorGithubApp?: boolean;
-            skipReviewerRequest?: boolean;
-          };
-          summary?: string;
-          createdAt: string;
-        }>("GET", `/v0/agents/${args.id}`);
-
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
-        };
+        const agent = await apiRequest<Agent>(
+          "GET",
+          `/v1/agents/${args.id}`
+        );
+        const run = await getLatestRun(agent);
+        const data = enrichAgent(agent, run);
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_run",
+    {
+      title: "Create Follow-up Run",
+      description: `Send a follow-up prompt to an existing agent (API v1). Creates a new run on the agent's conversation and workspace. Only one run can be active per agent — wait until IDLE / terminal run status, or cancel the active run first.
+
+**Usage Example:** \`create_run({ id: "bc-...", prompt: "Also add a troubleshooting section" })\`
+
+**Workflow:**
+1. Create an agent with \`create_agent\`
+2. Monitor with \`get_agent\` until agent is IDLE (or latest run is FINISHED/ERROR/CANCELLED)
+3. Send follow-ups with \`create_run\`
+4. Continue monitoring`,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID"),
+        prompt: z.string().min(1).describe("Follow-up instructions"),
+        mode: z
+          .enum(["agent", "plan"])
+          .optional()
+          .describe("Override conversation mode for this run"),
+      },
+      outputSchema: {
+        run: z.object({
+          id: z.string(),
+          agentId: z.string(),
+          status: z.string(),
+          createdAt: z.string(),
+        }),
+      },
+    },
+    async (args) => {
+      try {
+        const body: Record<string, unknown> = {
+          prompt: { text: args.prompt },
         };
+        if (args.mode) {
+          body.mode = args.mode;
+        }
+
+        const data = await apiRequest<CreateRunResponse>(
+          "POST",
+          `/v1/agents/${args.id}/runs`,
+          body
+        );
+
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
@@ -779,45 +860,106 @@ export function setupServer(server: McpServer): void {
   server.registerTool(
     "add_followup",
     {
-      title: "Add Follow-up Instruction",
-      description: `Send additional instructions to a RUNNING task. Use this to guide the task, request changes, provide clarification, or redirect its work while it is actively running.
-
-**Usage Example:** \`add_followup({ id: "bc_abc123", prompt: "Also add a troubleshooting section" })\`
-
-**Important:** The task must be in RUNNING status. Use \`get_task\` to check status first. If the task is FINISHED, FAILED, or CANCELLED, you cannot send follow-ups.
-
-**Workflow:** 
-1. Create a task with \`create_task\`
-2. Monitor with \`get_task\` until status is RUNNING
-3. Send follow-up instructions as needed
-4. Continue monitoring until FINISHED`,
+      title: "Add Follow-up (alias)",
+      description:
+        "Alias for `create_run`. Prefer `create_run` — in API v1 follow-ups are new runs on the agent.",
       inputSchema: {
-        id: z.string().min(1).describe("Task ID (must be in RUNNING status)"),
+        id: z.string().min(1).describe("Agent ID"),
         prompt: z.string().min(1).describe("Follow-up instructions"),
-      },
-      outputSchema: {
-        id: z.string(),
       },
     },
     async (args) => {
       try {
-        const data = await apiRequest<{ id: string }>(
+        const data = await apiRequest<CreateRunResponse>(
           "POST",
-          `/v0/agents/${args.id}/followup`,
+          `/v1/agents/${args.id}/runs`,
           { prompt: { text: args.prompt } }
         );
-
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
-        };
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "list_runs",
+    {
+      title: "List Agent Runs",
+      description: `List runs for an agent, newest first. Each run is one prompt submission (initial create or follow-up).
+
+**Usage Example:** \`list_runs({ id: "bc-..." })\``,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID"),
+        limit: z.number().int().min(1).max(100).optional(),
+        cursor: z.string().optional(),
+      },
+    },
+    async (args) => {
+      try {
+        const params = new URLSearchParams();
+        if (args.limit) params.append("limit", args.limit.toString());
+        if (args.cursor) params.append("cursor", args.cursor);
+        const qs = params.toString() ? `?${params}` : "";
+        const data = await apiRequest<ListRunsResponse>(
+          "GET",
+          `/v1/agents/${args.id}/runs${qs}`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "get_run",
+    {
+      title: "Get Run Status",
+      description: `Get status, timestamps, and (for terminal runs) the final result, duration, and pushed branches/PRs for a specific run.
+
+**Usage Example:** \`get_run({ id: "bc-...", run_id: "run-..." })\`
+
+**Run status:** CREATING | RUNNING | FINISHED | ERROR | CANCELLED | EXPIRED`,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID"),
+        run_id: z.string().min(1).describe("Run ID"),
+      },
+    },
+    async (args) => {
+      try {
+        const data = await apiRequest<Run>(
+          "GET",
+          `/v1/agents/${args.id}/runs/${args.run_id}`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "cancel_run",
+    {
+      title: "Cancel Run",
+      description: `Cancel the active run for an agent. Cancellation is terminal — the run becomes CANCELLED. To continue, create a new run with \`create_run\`.
+
+**Usage Example:** \`cancel_run({ id: "bc-...", run_id: "run-..." })\``,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID"),
+        run_id: z.string().min(1).describe("Run ID to cancel"),
+      },
+    },
+    async (args) => {
+      try {
+        const data = await apiRequest<IdResponse>(
+          "POST",
+          `/v1/agents/${args.id}/runs/${args.run_id}/cancel`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
@@ -825,44 +967,146 @@ export function setupServer(server: McpServer): void {
   server.registerTool(
     "get_conversation",
     {
-      title: "Get Task Conversation",
-      description: `Get the complete conversation history of a task including the original prompt, all follow-ups, and every task response. Useful for reviewing what a task did, understanding its reasoning, and debugging issues.
+      title: "Get Agent Run Summaries",
+      description: `Approximate conversation history by listing runs and their terminal \`result\` text (API v1 has no dedicated /conversation endpoint — that was v0-only).
 
-**Usage Example:** \`get_conversation({ id: "bc_abc123" })\`
+Returns runs newest-first with status and result when available. For live streaming, use the Cursor dashboard or the SSE stream endpoint.
 
-**Workflow:** After a task finishes (or fails), use this tool to review the full conversation. This helps you understand what the task did, why it made certain decisions, and what went wrong if it failed. Use \`list_tasks\` to find task IDs, then \`get_conversation\` to review their work.`,
+**Usage Example:** \`get_conversation({ id: "bc-..." })\``,
       inputSchema: {
-        id: z.string().min(1).describe("Task ID"),
-      },
-      outputSchema: {
-        id: z.string(),
-        messages: z.array(
-          z.object({
-            id: z.string(),
-            type: z.string(),
-            text: z.string(),
-          })
-        ),
+        id: z.string().min(1).describe("Agent ID"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Max runs to include (default: 20)"),
       },
     },
     async (args) => {
       try {
-        const data = await apiRequest<{
-          id: string;
-          messages: Array<{ id: string; type: string; text: string }>;
-        }>("GET", `/v0/agents/${args.id}/conversation`);
+        const limit = args.limit ?? 20;
+        const listed = await apiRequest<ListRunsResponse>(
+          "GET",
+          `/v1/agents/${args.id}/runs?limit=${limit}`
+        );
 
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
+        const messages: Array<{
+          id: string;
+          type: string;
+          text: string;
+          status: string;
+          createdAt: string;
+        }> = [];
+
+        for (const item of listed.items) {
+          let run = item;
+          if (
+            !run.result &&
+            ["FINISHED", "ERROR", "CANCELLED", "EXPIRED"].includes(run.status)
+          ) {
+            try {
+              run = await apiRequest<Run>(
+                "GET",
+                `/v1/agents/${args.id}/runs/${item.id}`
+              );
+            } catch {
+              // keep list item
+            }
+          }
+
+          messages.push({
+            id: run.id,
+            type: "run_result",
+            text: run.result ?? `(run ${run.status}, no result text yet)`,
+            status: run.status,
+            createdAt: run.createdAt,
+          });
+        }
+
+        const data = {
+          id: args.id,
+          note: "v1 API has no conversation endpoint; this lists run results instead of full user/assistant turns.",
+          messages,
+          nextCursor: listed.nextCursor,
         };
+
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "archive_agent",
+    {
+      title: "Archive Agent",
+      description: `Soft-delete an agent. Archived agents remain readable but cannot accept new runs until unarchived. Prefer this over permanent delete.
+
+**Usage Example:** \`archive_agent({ id: "bc-..." })\``,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID to archive"),
+      },
+    },
+    async (args) => {
+      try {
+        const data = await apiRequest<IdResponse>(
+          "POST",
+          `/v1/agents/${args.id}/archive`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "unarchive_agent",
+    {
+      title: "Unarchive Agent",
+      description: `Unarchive an agent so it can accept new runs again.
+
+**Usage Example:** \`unarchive_agent({ id: "bc-..." })\``,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID to unarchive"),
+      },
+    },
+    async (args) => {
+      try {
+        const data = await apiRequest<IdResponse>(
+          "POST",
+          `/v1/agents/${args.id}/unarchive`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "delete_agent",
+    {
+      title: "Delete Agent Permanently",
+      description: `Permanently delete a cloud agent. Irreversible. Prefer \`archive_agent\` for reversible removal.
+
+**Usage Example:** \`delete_agent({ id: "bc-..." })\``,
+      inputSchema: {
+        id: z.string().min(1).describe("Agent ID to delete"),
+      },
+    },
+    async (args) => {
+      try {
+        const data = await apiRequest<IdResponse>(
+          "DELETE",
+          `/v1/agents/${args.id}`
+        );
+        return toolResult(data);
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
@@ -870,52 +1114,36 @@ export function setupServer(server: McpServer): void {
   server.registerTool(
     "delete_task",
     {
-      title: "Delete Task",
-      description: `Permanently delete a cloud task. This action cannot be undone and all conversation history will be lost. Use this to clean up tasks you no longer need.
-
-**Usage Example:** \`delete_task({ id: "bc_abc123" })\`
-
-**Warning:** This permanently deletes the task and all its data. If you want to review the conversation first, use \`get_conversation\` before deleting.
-
-**Workflow:** Use \`list_tasks\` to find tasks, optionally filter them, then delete unwanted ones. Consider reviewing conversations with \`get_conversation\` before deletion if you might need the information later.`,
+      title: "Delete Task (alias)",
+      description:
+        "Alias for `delete_agent`. Prefer `delete_agent` or `archive_agent`.",
       inputSchema: {
-        id: z.string().min(1).describe("Task ID to delete"),
-      },
-      outputSchema: {
-        id: z.string(),
+        id: z.string().min(1).describe("Agent ID to delete"),
       },
     },
     async (args) => {
       try {
-        const data = await apiRequest<{ id: string }>(
+        const data = await apiRequest<IdResponse>(
           "DELETE",
-          `/v0/agents/${args.id}`
+          `/v1/agents/${args.id}`
         );
-        return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          structuredContent: data,
-        };
+        return toolResult(data);
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: `Error: ${errorMessage}` }],
-          isError: true,
-        };
+        return toolError(error);
       }
     }
   );
 
-  // ============================================================================
-  // PROMPTS (Workflow templates)
-  // ============================================================================
+  // --------------------------------------------------------------------------
+  // PROMPTS
+  // --------------------------------------------------------------------------
 
   server.registerPrompt(
     "plan-parallel-tasks",
     {
-      title: "Plan Parallel Tasks",
+      title: "Plan Parallel Agents",
       description:
-        "Break down a project into parallelizable tasks for multiple cloud tasks. Auto-detects repository context and creates a phased execution plan.",
+        "Break down a project into parallelizable work for multiple cloud agents. Auto-detects repository context and creates a phased execution plan.",
       argsSchema: {
         project_description: z
           .string()
@@ -936,7 +1164,7 @@ export function setupServer(server: McpServer): void {
           role: "user",
           content: {
             type: "text",
-            text: `Plan parallel cloud tasks for this project:
+            text: `Plan parallel cloud agents for this project:
 
 ${project_description}
 
@@ -962,16 +1190,16 @@ ${branch ? `Branch: ${branch}` : ""}
 
 For each task provide:
 - **Task Name**: Short name
-- **Files**: List of files to create/modify  
+- **Files**: List of files to create/modify
 - **Dependencies**: Tasks that must complete first (or "None")
-- **Prompt**: Exact text for create_task
+- **Prompt**: Exact text for create_agent
 
 Group into phases:
 - **Phase 1**: No dependencies (run all in parallel)
 - **Phase 2**: Depends on Phase 1 (run in parallel after Phase 1)
 - **Phase 3**: Integration (sequential, touches shared files)
 
-After approval, use create_task for each Phase 1 task, then monitor with list_tasks.`,
+After approval, use create_agent for each Phase 1 task, then monitor with list_agents / get_agent.`,
           },
         },
       ],

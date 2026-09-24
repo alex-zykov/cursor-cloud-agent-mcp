@@ -9,7 +9,7 @@ import { setupServer } from "./backend.js";
 
 const server = new McpServer({
   name: "cursor-cloud-agent-mcp",
-  version: "1.0.2",
+  version: "2.0.0",
 });
 
 setupServer(server);
@@ -25,7 +25,8 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "cursor-cloud-agent-mcp",
-    version: "1.0.2",
+    version: "2.0.0",
+    api: "v1",
   });
 });
 

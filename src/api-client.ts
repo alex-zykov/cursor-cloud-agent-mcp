@@ -1,12 +1,15 @@
 /**
- * API client for Cursor Cloud Agents API
+ * API client for Cursor Cloud Agents API v1
+ * @see https://cursor.com/docs/cloud-agent/api/endpoints
  */
 
 import { logger } from "./logger.js";
-import { ApiError, TimeoutError, sanitizeErrorMessage } from "./errors.js";
+import { ApiError, TimeoutError } from "./errors.js";
 
 const API_BASE_URL = "https://api.cursor.com";
-const REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 30000;
+/** List repositories can take tens of seconds for large accounts. */
+const REPOSITORIES_TIMEOUT_MS = 120000;
 
 /**
  * Make an API request to the Cursor Cloud Agents API
@@ -14,7 +17,8 @@ const REQUEST_TIMEOUT_MS = 30000;
 export async function apiRequest<T>(
   method: "GET" | "POST" | "DELETE",
   path: string,
-  body?: unknown
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<T> {
   const apiKey = process.env.CURSOR_API_KEY;
   if (!apiKey) {
@@ -25,7 +29,7 @@ export async function apiRequest<T>(
   const authHeader = `Basic ${Buffer.from(`${apiKey}:`).toString("base64")}`;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const options: RequestInit = {
@@ -37,7 +41,7 @@ export async function apiRequest<T>(
       signal: controller.signal,
     };
 
-    if (body) {
+    if (body !== undefined) {
       options.body = JSON.stringify(body);
     }
 
@@ -58,11 +62,21 @@ export async function apiRequest<T>(
         `API error ${response.status}: ${errorText}`,
         response.status
       );
-      logger.error("API request failed", error, { method, path, status: response.status });
+      logger.error("API request failed", error, {
+        method,
+        path,
+        status: response.status,
+      });
       throw error;
     }
 
-    const data = await response.json() as T;
+    // Some endpoints (e.g. DELETE) may return empty bodies
+    const text = await response.text();
+    if (!text) {
+      return {} as T;
+    }
+
+    const data = JSON.parse(text) as T;
     logger.debug("API request successful", { method, path });
     return data;
   } catch (error) {
@@ -72,8 +86,8 @@ export async function apiRequest<T>(
     }
     if (error instanceof Error && error.name === "AbortError") {
       const timeoutError = new TimeoutError(
-        `Request timeout after ${REQUEST_TIMEOUT_MS}ms`,
-        REQUEST_TIMEOUT_MS
+        `Request timeout after ${timeoutMs}ms`,
+        timeoutMs
       );
       logger.error("API request timeout", timeoutError, { method, path });
       throw timeoutError;
@@ -83,3 +97,6 @@ export async function apiRequest<T>(
   }
 }
 
+export function repositoriesTimeout(): number {
+  return REPOSITORIES_TIMEOUT_MS;
+}

@@ -1,7 +1,7 @@
 {
   "name": "cursor-cloud-agent-mcp",
-  "version": "1.0.2",
-  "description": "MCP server that exposes Cursor Cloud Agents API endpoints as tools for AI assistants",
+  "version": "2.0.0",
+  "description": "MCP server for Cursor Cloud Agents API v1 (agent + run model)",
   "type": "module",
   "main": "src/server.ts",
   "bin": {
@@ -31,7 +31,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jxnl/cursor-cloud-agent-mcp.git"
+    "url": "git+https://github.com/alex-zykov/cursor-cloud-agent-mcp.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.22.0",
