@@ -383,7 +383,9 @@ export function setupServer(server: McpServer): void {
         model: z
           .string()
           .optional()
-          .describe("LLM model id from get_models (omit for default)"),
+          .describe(
+            'LLM model id from get_models (omit for default). If the user asks for "Auto" / "auto", pass the literal string "auto" — it is a valid model id accepted by the API even though it is not listed in get_models.'
+          ),
         name: z
           .string()
           .max(100)
@@ -513,7 +515,9 @@ export function setupServer(server: McpServer): void {
         model: z
           .string()
           .optional()
-          .describe("LLM model to use (omit for auto-selection)"),
+          .describe(
+            'LLM model to use (omit for auto-selection). If the user asks for "Auto" / "auto", pass the literal string "auto" — it is a valid model id accepted by the API even though it is not listed in get_models.'
+          ),
         plan_file: z
           .string()
           .optional()
