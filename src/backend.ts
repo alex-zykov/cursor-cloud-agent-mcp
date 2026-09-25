@@ -163,27 +163,6 @@ export function setupServer(server: McpServer): void {
             'Array of regex patterns to filter repositories. Matches repository name, owner, or full URL. Patterns are OR conditions (match if any pattern matches). REQUIRED when include_all is true. Example: ["^my-.*", ".*api.*"]'
           ),
       },
-      outputSchema: {
-        current: z
-          .object({
-            repository: z.string(),
-            branch: z.string().optional(),
-            has_uncommitted_changes: z.boolean().optional(),
-          })
-          .optional(),
-        available: z
-          .array(
-            z.object({
-              owner: z.string(),
-              name: z.string(),
-              repository: z.string(),
-            })
-          )
-          .optional(),
-        message: z.string().optional(),
-        filtered_count: z.number().optional(),
-        total_count: z.number().optional(),
-      },
     },
     async (args) => {
       try {
@@ -307,14 +286,6 @@ export function setupServer(server: McpServer): void {
 
 **Workflow:** Call this first to verify your API key is valid before using other tools.`,
       inputSchema: {},
-      outputSchema: {
-        apiKeyName: z.string(),
-        createdAt: z.string(),
-        userId: z.number().optional(),
-        userEmail: z.string().optional(),
-        userFirstName: z.string().optional(),
-        userLastName: z.string().optional(),
-      },
     },
     async () => {
       try {
@@ -336,17 +307,6 @@ export function setupServer(server: McpServer): void {
 
 **Workflow:** Use this to see available models, then optionally specify one in \`create_agent\`. For most cases, omitting the model parameter (auto-selection) is recommended.`,
       inputSchema: {},
-      outputSchema: {
-        items: z.array(
-          z.object({
-            id: z.string(),
-            displayName: z.string(),
-            description: z.string().optional(),
-            aliases: z.array(z.string()).optional(),
-          })
-        ),
-        models: z.array(z.string()),
-      },
     },
     async () => {
       try {
@@ -441,22 +401,6 @@ export function setupServer(server: McpServer): void {
           .describe(
             "Path to a plan file to include in the prompt (relative or absolute path)"
           ),
-      },
-      outputSchema: {
-        agent: z.object({
-          id: z.string(),
-          name: z.string(),
-          status: z.string(),
-          url: z.string().optional(),
-          latestRunId: z.string().optional(),
-          createdAt: z.string(),
-        }),
-        run: z.object({
-          id: z.string(),
-          agentId: z.string(),
-          status: z.string(),
-          createdAt: z.string(),
-        }),
       },
     },
     async (args) => {
@@ -652,21 +596,6 @@ export function setupServer(server: McpServer): void {
             'Regex pattern to filter agents across id, name, status, url, etc. Example: "ACTIVE|IDLE" or ".*my-repo.*"'
           ),
       },
-      outputSchema: {
-        agents: z.array(
-          z.object({
-            id: z.string(),
-            name: z.string(),
-            status: z.string(),
-            url: z.string().optional(),
-            latestRunId: z.string().optional(),
-            createdAt: z.string(),
-          })
-        ),
-        nextCursor: z.string().optional(),
-        filtered_count: z.number().optional(),
-        total_count: z.number().optional(),
-      },
     },
     async (args) => {
       try {
@@ -825,14 +754,6 @@ export function setupServer(server: McpServer): void {
           .enum(["agent", "plan"])
           .optional()
           .describe("Override conversation mode for this run"),
-      },
-      outputSchema: {
-        run: z.object({
-          id: z.string(),
-          agentId: z.string(),
-          status: z.string(),
-          createdAt: z.string(),
-        }),
       },
     },
     async (args) => {
